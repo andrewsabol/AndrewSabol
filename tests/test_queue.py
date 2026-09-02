@@ -262,3 +262,68 @@ def test_assignments_accumulate_without_overdrawing(session, shortfall):
     assert receivable_balance(shortfall["r_alex"]).available == Decimal("100.00")
     # Sarah was skipped entirely, so her whole claim is still queued.
     assert receivable_balance(shortfall["r_sarah"]).available == Decimal("400.00")
+
+
+# --------------------------------------------------------------------------
+# Payment methods recorded on someone else's behalf
+# --------------------------------------------------------------------------
+
+
+def test_admin_can_record_a_method_for_someone_who_never_opened_the_bot(
+    session, batch, make_user
+):
+    """Payroll names people by @username long before they join."""
+    from payroll_bot.models import PaymentMethodKind
+    from payroll_bot.services import accounts
+
+    mike = make_user("mike")  # no methods, no telegram_id
+    assert accounts.list_payment_methods(session, mike.user_id) == []
+
+    accounts.add_payment_method(
+        session, mike, PaymentMethodKind.VENMO, "@MikeExample"
+    )
+    session.flush()
+
+    methods = accounts.list_payment_methods(session, mike.user_id)
+    assert [m.display for m in methods] == ["Venmo: @MikeExample"]
+
+
+def test_a_recorded_method_makes_the_pairing_compatible(session, batch, make_user):
+    """The point of recording it: routing stops being flagged."""
+    from payroll_bot.models import PaymentMethodKind
+    from payroll_bot.services import accounts
+
+    john = make_user("john", methods=["VENMO"])
+    mike = make_user("mike")
+
+    payable = payroll_service.add_payable(session, batch, john, Decimal("100"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("100"))
+    session.flush()
+
+    flagged = payroll_service.assign_settlement(
+        session, payable, r_mike, Decimal("50")
+    )
+    assert flagged.needs_admin_review
+
+    accounts.add_payment_method(
+        session, mike, PaymentMethodKind.VENMO, "@MikeExample"
+    )
+    session.flush()
+
+    ok = payroll_service.assign_settlement(session, payable, r_mike, Decimal("50"))
+    assert not ok.needs_admin_review
+    assert ok.payment_method_note == "Venmo: @MikeExample"
+
+
+def test_removing_a_method_deactivates_rather_than_deletes(session, make_user):
+    """Settlements reference the method by id, so the row must survive."""
+    from payroll_bot.services import accounts
+
+    mike = make_user("mike", methods=["VENMO"])
+    method = accounts.list_payment_methods(session, mike.user_id)[0]
+
+    accounts.remove_payment_method(session, method)
+    session.flush()
+
+    assert accounts.list_payment_methods(session, mike.user_id) == []
+    assert accounts.list_payment_methods(session, mike.user_id, active_only=False)

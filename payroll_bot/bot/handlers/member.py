@@ -16,6 +16,7 @@ from ...services import settlement as settlement_service
 from ...services.accounts import (
     AccountError,
     add_payment_method,
+    find_user,
     list_payment_methods,
     parse_kind,
     remove_payment_method,
@@ -51,6 +52,9 @@ ADMIN_HELP = """
 /generate — build a settlement plan
 /queue — everyone waiting to be paid, in order
 /next [@payer] — the next person in line, with their payment methods
+/methods @handle — see someone's payment methods
+/setmethod @handle venmo @TheirHandle — record one for them
+/delmethod @handle <id> — remove one
 /verify — review payments awaiting verification
 /user @handle — one person's full position
 /reassign <id> to @user [amount] — re-route a settlement
@@ -189,6 +193,26 @@ async def methods_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     with session_scope() as session:
         user = touch_user(session, update)
+
+        # "/methods @mike" -- an admin checking someone else's handles before
+        # routing a payment to them.
+        if args and args[0].startswith("@") and require_admin(session, update, context):
+            target = find_user(session, args[0])
+            if target is None:
+                await reply(update, f"No user matching {args[0]}.")
+                return
+            methods = list_payment_methods(session, target.user_id)
+            lines = [f"*{target.label.upper()} — PAYMENT METHODS*", ""]
+            if methods:
+                lines += [f"  `{m.payment_method_id}` {m.display}" for m in methods]
+            else:
+                lines.append("_None on file._")
+                lines.append("")
+                lines.append(
+                    f"Add one with `/setmethod {target.label} venmo @TheirHandle`"
+                )
+            await reply(update, "\n".join(lines))
+            return
 
         if args and args[0].lower() == "add":
             if len(args) < 3:

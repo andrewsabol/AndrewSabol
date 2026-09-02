@@ -784,6 +784,8 @@ def build_handlers() -> list:
         CommandHandler("audit", audit_command),
         CommandHandler("generate", generate_settlements),
         CommandHandler("queue", queue_command),
+        CommandHandler("setmethod", setmethod_command),
+        CommandHandler("delmethod", delmethod_command),
         CommandHandler("next", next_command),
         CommandHandler("verify", needs_verification),
     ]
@@ -985,3 +987,98 @@ async def queue_assign(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text += f"\n\n{delivered.summary}"
 
     await edit_or_reply(update, text, markup=keyboards.queue_list_keyboard())
+
+
+# --------------------------------------------------------------------------
+# Payment methods on someone else's behalf
+# --------------------------------------------------------------------------
+
+
+async def setmethod_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/setmethod @handle <kind> <handle>`` -- record a method for someone else.
+
+    Admins routinely know a person's Venmo before that person has ever opened
+    the bot, and payroll is entered by @username well ahead of anyone joining.
+    Without this, a recipient who never sends /methods can never be routed a
+    compatible payment.
+    """
+    args = context.args or []
+    usage = (
+        "Usage: `/setmethod @handle <venmo|cashapp|zelle|paypal|other> <their handle>`\n"
+        "Example: `/setmethod @mike venmo @MikeExample`"
+    )
+    if len(args) < 3:
+        await reply(update, usage)
+        return
+
+    with session_scope() as session:
+        if not require_admin(session, update, context):
+            await deny(update)
+            return
+
+        actor = touch_user(session, update)
+        target = find_user(session, args[0])
+        if target is None:
+            await reply(
+                update,
+                f"No user matching {args[0]}. They appear once they're named in "
+                "a payroll, or when they send /start.",
+            )
+            return
+
+        try:
+            kind = accounts_service.parse_kind(args[1])
+        except accounts_service.AccountError as exc:
+            await reply(update, f"❌ {exc}")
+            return
+
+        handle = " ".join(args[2:])
+        accounts_service.add_payment_method(
+            session, target, kind, handle, actor_user_id=actor.user_id
+        )
+        session.flush()
+
+        methods = accounts_service.list_payment_methods(session, target.user_id)
+        lines = [
+            f"✅ Saved for {target.label}: {kind.value.title()} {handle}",
+            "",
+            f"*{target.label} now accepts:*",
+        ]
+        lines += [f"  `{m.payment_method_id}` {m.display}" for m in methods]
+        text = "\n".join(lines)
+
+    await reply(update, text)
+
+
+async def delmethod_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/delmethod @handle <id>`` -- remove someone else's payment method."""
+    args = context.args or []
+    if len(args) < 2 or not args[1].isdigit():
+        await reply(update, "Usage: `/delmethod @handle <id>`")
+        return
+
+    with session_scope() as session:
+        if not require_admin(session, update, context):
+            await deny(update)
+            return
+
+        actor = touch_user(session, update)
+        target = find_user(session, args[0])
+        if target is None:
+            await reply(update, f"No user matching {args[0]}.")
+            return
+
+        methods = accounts_service.list_payment_methods(session, target.user_id)
+        method = next(
+            (m for m in methods if m.payment_method_id == int(args[1])), None
+        )
+        if method is None:
+            await reply(update, f"{target.label} has no payment method #{args[1]}.")
+            return
+
+        accounts_service.remove_payment_method(
+            session, method, actor_user_id=actor.user_id
+        )
+        text = f"✅ Removed {method.display} from {target.label}."
+
+    await reply(update, text)
