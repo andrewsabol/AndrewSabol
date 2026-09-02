@@ -93,6 +93,7 @@ rather than silently importing binary rounding error into a financial ledger.
 | `/start`, `/help` | Introduction and your command list |
 | `/balance` | What you owe and what you're owed, with live progress |
 | `/methods` | Manage your Venmo / Cash App / Zelle / PayPal handles |
+| `/whoami` | Your Telegram ID, username and admin status |
 
 ### Administrators
 
@@ -101,6 +102,10 @@ rather than silently importing binary rounding error into a financial ledger.
 | `/payroll` | Enter `OWES` / `OWED` balances |
 | `/dashboard` | Current payroll overview, with drill-down buttons |
 | `/generate` | Build a settlement plan (preview only) |
+| `/queue` | Everyone waiting to be paid, longest wait first |
+| `/next [@payer]` | Step through the queue, with skip and assign |
+| `/setmethod @handle venmo @Theirs` | Record a payment method for someone else |
+| `/delmethod @handle <id>` | Remove one |
 | `/verify` | Review payments awaiting verification |
 | `/user @handle` | One person's full position |
 | `/reassign <id> to @user [amount]` | Manually re-route a settlement |
@@ -130,20 +135,65 @@ OWED
 @alex 250
 ```
 
-The bot totals both sides and reports the difference. If they don't match it
-refuses to proceed silently:
+**The two sides do not have to match.** People are routinely owed money before
+the payers covering them have settled up, so a shortfall is a schedule rather
+than an error. The bot totals both sides and describes the gap:
 
 ```
-⚠️ PAYROLL DOES NOT BALANCE
-Total Owed: $5,420
-Total Receivable: $5,370
-Difference: $50
+ℹ️ $500.00 more is owed out than has come in. The queue pays people in the
+order they were added, so this covers the front of the line first and the
+rest waits for later payers.
 ```
 
-Settlements are **not** generated until the admin fixes the discrepancy or
-explicitly confirms it. Unreadable lines are reported by line number rather than
-skipped — a silently dropped row is a payroll that balances on screen and not in
-reality.
+Unreadable lines *are* still reported, by line number, and no payroll
+containing an error is applied even partially — a silently dropped row is a
+payroll that reconciles on screen and not in reality.
+
+### The payment queue
+
+Because a payroll need not balance, something has to decide who gets paid
+first. People are paid in the order they were added:
+
+```
+PAYMENT QUEUE
+3 waiting · $900.00 still owed
+Longest wait first.
+
+ 1 ▸ @mike — $300.00  today
+ 2 ▸ @sarah — $400.00  today
+ 3 ▸ @alex — $200.00  today
+
+▸ = still needs someone assigned to pay them
+```
+
+Position is **derived from creation order, never stored**, so paying someone
+off moves everyone behind them up automatically and no field can drift out of
+step with the ledger. Partially paid people keep their place, and someone whose
+amount is routed but not yet verified stays queued — routed money is not
+received money.
+
+`/next` steps through the queue one person at a time, showing every payment
+method they accept. Skipping wraps around, so an admin cycling to find someone
+a given payer can actually pay never reaches a dead end:
+
+```
+NEXT IN LINE · 1 of 3
+
+@mike
+Still owed: $300.00
+added today
+
+Pay them with:
+  Venmo: @MikeExample  ✅
+
+@john can pay them by Venmo.
+
+[✅ Assign this payment]  [⬅️ Previous]  [Skip ➡️]
+```
+
+`/next @john` marks which methods the two share and offers to assign the
+payment. Manual assignment goes through the same capacity checks as a generated
+plan — a hand-picked pairing gets no licence to overdraw a balance.
 
 ### Generating and approving a plan
 
@@ -254,6 +304,7 @@ payroll_bot/
 ├── models.py           SQLAlchemy schema; money stored as exact integer cents
 ├── ledger.py           Balance arithmetic and capacity validation
 ├── matching.py         Greedy bipartite matching engine
+├── queue.py            Who gets paid next, derived from creation order
 ├── parsing.py          OWES/OWED block parser
 ├── audit.py            Append-only history
 ├── config.py           Environment configuration
@@ -275,7 +326,7 @@ payroll_bot/
 
 Handlers contain no financial logic. Everything that touches money lives in
 `services/`, which makes the rules testable without a Telegram connection — the
-67-test suite never starts a bot.
+107-test suite never starts a bot.
 
 Each mutation runs inside `session_scope()`, which commits on success and rolls
 back on any exception, so a settlement can never be created without its audit
@@ -297,7 +348,7 @@ correction, so any payroll period can be replayed.
 python -m pytest
 ```
 
-67 tests covering the spec's worked examples, the accounting invariants
+107 tests covering the spec's worked examples, the accounting invariants
 (generation doesn't move balances; verification does; cancellation frees
 capacity), the state machine and its authorization rules, exact-decimal
 arithmetic through a database round trip, and the parser's error reporting.
