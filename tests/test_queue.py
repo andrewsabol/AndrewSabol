@@ -327,3 +327,147 @@ def test_removing_a_method_deactivates_rather_than_deletes(session, make_user):
 
     assert accounts.list_payment_methods(session, mike.user_id) == []
     assert accounts.list_payment_methods(session, mike.user_id, active_only=False)
+
+
+# --------------------------------------------------------------------------
+# Partial payments
+# --------------------------------------------------------------------------
+
+
+def test_partial_payment_credits_only_what_arrived(session, batch, make_user):
+    """Routed $500, only $100 sent: credit $100, keep owing $400."""
+    from payroll_bot.ledger import payable_balance
+
+    john = make_user("john", methods=["VENMO"])
+    mike = make_user("mike", methods=["VENMO"])
+    payable = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+
+    settlement = payroll_service.assign_settlement(
+        session, payable, r_mike, Decimal("500")
+    )
+    session.flush()
+
+    settlement_service.verify_partial(
+        session, settlement, Decimal("100"), actor_user_id=1
+    )
+    session.flush()
+
+    recipient = receivable_balance(r_mike)
+    assert recipient.verified == Decimal("100.00")
+    assert recipient.remaining == Decimal("400.00")
+
+    # The payer is credited for what they actually sent, and still owes the rest.
+    payer = payable_balance(payable)
+    assert payer.verified == Decimal("100.00")
+    assert payer.remaining == Decimal("400.00")
+
+
+def test_the_shortfall_returns_to_the_pool_for_rerouting(session, batch, make_user):
+    """The unpaid $400 is not written off - it can be routed again."""
+    from payroll_bot.ledger import payable_balance
+
+    john = make_user("john")
+    mike = make_user("mike")
+    payable = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+
+    settlement = payroll_service.assign_settlement(
+        session, payable, r_mike, Decimal("500")
+    )
+    settlement_service.verify_partial(
+        session, settlement, Decimal("100"), actor_user_id=1
+    )
+    session.flush()
+
+    assert payable_balance(payable).available == Decimal("400.00")
+    assert receivable_balance(r_mike).available == Decimal("400.00")
+
+    # And it really can be re-routed.
+    again = payroll_service.assign_settlement(
+        session, payable, r_mike, Decimal("400")
+    )
+    assert again.amount == Decimal("400.00")
+
+
+def test_partially_paid_person_stays_in_the_queue(session, batch, make_user):
+    john = make_user("john")
+    mike = make_user("mike")
+    payable = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+
+    settlement = payroll_service.assign_settlement(
+        session, payable, r_mike, Decimal("500")
+    )
+    settlement_service.verify_partial(
+        session, settlement, Decimal("100"), actor_user_id=1
+    )
+    session.flush()
+
+    entries = payment_queue.build_queue(session, batch.batch_id)
+    assert entries[0].user.label == "@mike"
+    assert entries[0].still_owed == Decimal("400.00")
+
+
+def test_partial_for_the_full_amount_is_a_normal_verification(session, batch, make_user):
+    john = make_user("john")
+    mike = make_user("mike")
+    payable = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+
+    settlement = payroll_service.assign_settlement(
+        session, payable, r_mike, Decimal("500")
+    )
+    settlement_service.verify_partial(
+        session, settlement, Decimal("500"), actor_user_id=1
+    )
+    session.flush()
+    assert receivable_balance(r_mike).remaining == Decimal("0.00")
+
+
+def test_cannot_credit_more_than_was_routed(session, batch, make_user):
+    john = make_user("john")
+    mike = make_user("mike")
+    payable = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+
+    settlement = payroll_service.assign_settlement(
+        session, payable, r_mike, Decimal("200")
+    )
+    with pytest.raises(settlement_service.SettlementError):
+        settlement_service.verify_partial(
+            session, settlement, Decimal("300"), actor_user_id=1
+        )
+
+
+def test_partial_records_both_figures_in_the_audit_trail(session, batch, make_user):
+    """The original routed amount must survive, not just what arrived."""
+    from payroll_bot import audit
+
+    john = make_user("john")
+    mike = make_user("mike")
+    payable = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+
+    settlement = payroll_service.assign_settlement(
+        session, payable, r_mike, Decimal("500")
+    )
+    settlement_service.verify_partial(
+        session, settlement, Decimal("100"), actor_user_id=1, reason="sent wrong amount"
+    )
+    session.flush()
+
+    detail = " ".join(
+        e.detail or ""
+        for e in audit.history(
+            session, entity_type="settlement", entity_id=settlement.settlement_id
+        )
+    )
+    assert "$100.00" in detail and "$500.00" in detail
+    assert "sent wrong amount" in detail

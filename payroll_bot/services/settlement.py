@@ -261,6 +261,81 @@ def admin_verify(
     return settlement
 
 
+def verify_partial(
+    session: Session,
+    settlement: Settlement,
+    received_amount: Decimal,
+    *,
+    actor_user_id: int,
+    reason: str | None = None,
+) -> Settlement:
+    """Verify a claimed payment for less than it was routed for.
+
+    A settlement is routed for $500 but only $100 actually arrives. Verifying
+    the whole thing would credit money nobody sent; rejecting it would discard
+    the $100 that genuinely did.
+
+    The settlement is reduced to what arrived and verified at that amount. The
+    shortfall is *not* written off -- because both balances are derived from
+    settlement amounts, cutting this settlement down returns the difference to
+    the payer's and the recipient's available balances automatically, ready to
+    be routed again. The recipient is still owed it; the payer still owes it.
+
+    Use this to record what happened, never ``modify_balance``: changing the
+    original amount would say the debt was always smaller, losing both the real
+    figure and the fact that a payment was made.
+    """
+    received_amount = money(received_amount)
+    if received_amount <= ZERO:
+        raise SettlementError("received amount must be greater than zero")
+
+    original = money(settlement.amount)
+    if received_amount > original:
+        raise SettlementError(
+            f"received {fmt(received_amount, settlement.currency)} is more than "
+            f"the {fmt(original, settlement.currency)} this settlement routes. "
+            "Assign the extra separately."
+        )
+    if settlement.status is SettlementStatus.VERIFIED:
+        raise SettlementError("this settlement is already verified")
+
+    if received_amount == original:
+        return admin_verify(session, settlement, actor_user_id=actor_user_id)
+
+    shortfall = money(original - received_amount)
+    settlement.amount = received_amount
+    settlement.admin_notes = _append_note(
+        settlement.admin_notes,
+        f"partial: {fmt(received_amount, settlement.currency)} of "
+        f"{fmt(original, settlement.currency)} received"
+        + (f" ({reason})" if reason else ""),
+    )
+
+    _transition(settlement, SettlementStatus.VERIFIED)
+    settlement.admin_verified_at = utcnow()
+    _resync(session, settlement)
+
+    audit.record(
+        session,
+        AuditAction.ADMIN_VERIFIED,
+        actor_user_id=actor_user_id,
+        batch_id=settlement.batch_id,
+        entity_type="settlement",
+        entity_id=settlement.settlement_id,
+        amount=received_amount,
+        detail=(
+            f"partially verified {settlement.payer.label} → "
+            f"{settlement.recipient.label}: "
+            f"{fmt(received_amount, settlement.currency)} of "
+            f"{fmt(original, settlement.currency)} received; "
+            f"{fmt(shortfall, settlement.currency)} returned to both balances"
+            + (f" ({reason})" if reason else "")
+        ),
+    )
+    maybe_complete_batch(session, settlement.batch_id, actor_user_id=actor_user_id)
+    return settlement
+
+
 def admin_reject(
     session: Session,
     settlement: Settlement,

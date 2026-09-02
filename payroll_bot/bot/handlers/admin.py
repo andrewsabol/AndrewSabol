@@ -816,6 +816,7 @@ def build_handlers() -> list:
         CommandHandler("delmethod", delmethod_command),
         CommandHandler("next", next_command),
         CommandHandler("verify", needs_verification),
+        CommandHandler("partial", partial_command),
     ]
 
 
@@ -1108,5 +1109,86 @@ async def delmethod_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             session, method, actor_user_id=actor.user_id
         )
         text = f"✅ Removed {method.display} from {target.label}."
+
+    await reply(update, text)
+
+
+async def partial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/partial <settlement_id> <amount received> [reason]``
+
+    Records that less arrived than was routed. The shortfall returns to both
+    balances rather than being written off, so it can be routed again.
+    """
+    args = context.args or []
+    usage = (
+        "Usage: `/partial <settlement_id> <amount actually received> [reason]`\n"
+        "Example: `/partial 3 100` — routed for $500, only $100 arrived.\n\n"
+        "The other $400 goes back to the queue; nobody is let off it."
+    )
+    if len(args) < 2:
+        await reply(update, usage)
+        return
+
+    try:
+        settlement_id = int(args[0])
+        received = money(args[1])
+    except (ValueError, MoneyError) as exc:
+        await reply(update, f"❌ {exc}\n\n{usage}")
+        return
+
+    reason = " ".join(args[2:]) or None
+
+    with session_scope() as session:
+        if not require_admin(session, update, context):
+            await deny(update)
+            return
+
+        actor = touch_user(session, update)
+        settlement = session.get(Settlement, settlement_id)
+        if settlement is None:
+            await reply(update, f"No settlement #{settlement_id}.")
+            return
+
+        routed = settlement.amount
+        try:
+            settlement_service.verify_partial(
+                session, settlement, received, actor_user_id=actor.user_id, reason=reason
+            )
+        except settlement_service.SettlementError as exc:
+            await reply(update, f"❌ {exc}")
+            return
+
+        session.flush()
+        receivable = session.get(Receivable, settlement.receivable_id)
+        still_owed = receivable_balance(receivable).remaining
+        shortfall = money(routed - received)
+
+        text = (
+            f"✅ *Recorded {views.fmt(received, settlement.currency)} received.*\n\n"
+            f"{settlement.payer.label} → {settlement.recipient.label}\n"
+            f"Routed: {views.fmt(routed, settlement.currency)}\n"
+            f"Received: {views.fmt(received, settlement.currency)}\n"
+            f"Returned to the queue: {views.fmt(shortfall, settlement.currency)}\n\n"
+            f"{settlement.recipient.label} is still owed "
+            f"{views.fmt(still_owed, settlement.currency)}."
+        )
+        recipient_id = settlement.recipient_user_id
+        payer_note = (
+            f"✅ {views.fmt(received, settlement.currency)} of your payment to "
+            f"{settlement.recipient.label} was verified. "
+            f"{views.fmt(shortfall, settlement.currency)} is still outstanding "
+            "and may be reassigned."
+        )
+        await notifications.notify_payer_result(
+            context.bot, session, settlement, payer_note
+        )
+        await notifications.notify_user(
+            context.bot,
+            session,
+            recipient_id,
+            f"✅ {views.fmt(received, settlement.currency)} from "
+            f"{settlement.payer.label} is verified. You are still owed "
+            f"{views.fmt(still_owed, settlement.currency)}.",
+        )
 
     await reply(update, text)
