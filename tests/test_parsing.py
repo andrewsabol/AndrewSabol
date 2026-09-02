@@ -89,3 +89,26 @@ def test_empty_input_is_empty_not_an_error():
     parsed = parse_payroll("")
     assert parsed.is_empty
     assert not parsed.errors
+
+
+def test_ignores_a_bot_command_pasted_into_the_block():
+    """People paste the command they were told to send along with the block."""
+    parsed = parse_payroll(
+        "OWES\n@john 500\n@chris 400\n\nOWED\n@mike 300\n@sarah 600\n/payroll"
+    )
+    assert not parsed.errors
+    assert parsed.total_owed == Decimal("900.00")
+    assert parsed.balances
+
+
+def test_ignores_a_group_style_bot_command():
+    """In groups Telegram sends commands as /payroll@BotName."""
+    parsed = parse_payroll("/payroll@SettlementBot\nOWES\n@a 100\nOWED\n@b 100")
+    assert not parsed.errors
+    assert parsed.balances
+
+
+def test_a_slash_does_not_hide_a_real_typo():
+    """Only a bare command is skipped; a malformed entry still reports."""
+    parsed = parse_payroll("OWES\n/john 500 oops\nOWED\n@b 100")
+    assert parsed.errors

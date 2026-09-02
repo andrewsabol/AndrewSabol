@@ -23,6 +23,11 @@ from decimal import Decimal
 
 from .money import ZERO, MoneyError, money, parse_amount
 
+# "/payroll", "/payroll@SettlementBot" - a bot command pasted into the block.
+# People naturally include the command they were told to send, and no username
+# can begin with a slash, so a line like this is never a real entry.
+_BOT_COMMAND = re.compile(r"^/[A-Za-z][A-Za-z0-9_]*(?:@[A-Za-z0-9_]+)?$")
+
 _OWES_HEADER = re.compile(r"^\s*(owes?|payables?|owing)\s*:?\s*$", re.IGNORECASE)
 _OWED_HEADER = re.compile(
     r"^\s*(owed|receivables?|is\s+owed|to\s+receive)\s*:?\s*$", re.IGNORECASE
@@ -94,6 +99,8 @@ def parse_payroll(text: str) -> ParsedPayroll:
     for index, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
+            continue
+        if _BOT_COMMAND.match(line):
             continue
 
         if _OWES_HEADER.match(line):
