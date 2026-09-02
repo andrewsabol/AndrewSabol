@@ -471,3 +471,88 @@ def test_partial_records_both_figures_in_the_audit_trail(session, batch, make_us
     )
     assert "$100.00" in detail and "$500.00" in detail
     assert "sent wrong amount" in detail
+
+
+# --------------------------------------------------------------------------
+# Recording payments by person
+# --------------------------------------------------------------------------
+
+
+def test_paid_by_person_spends_across_routed_settlements(session, batch, make_user):
+    """@mike is owed via two routed payments; $350 clears the first and dents the second."""
+    john = make_user("john")
+    chris = make_user("chris")
+    mike = make_user("mike")
+    p_john = payroll_service.add_payable(session, batch, john, Decimal("300"))
+    p_chris = payroll_service.add_payable(session, batch, chris, Decimal("300"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("600"))
+    session.flush()
+
+    payroll_service.assign_settlement(session, p_john, r_mike, Decimal("300"))
+    payroll_service.assign_settlement(session, p_chris, r_mike, Decimal("300"))
+    session.flush()
+
+    touched, leftover = settlement_service.record_payment_to(
+        session, batch.batch_id, mike.user_id, Decimal("350"), actor_user_id=1
+    )
+    session.flush()
+
+    assert len(touched) == 2
+    assert leftover == Decimal("0.00")
+    assert receivable_balance(r_mike).verified == Decimal("350.00")
+    assert receivable_balance(r_mike).remaining == Decimal("250.00")
+
+
+def test_paid_by_person_reports_what_it_could_not_apply(session, batch, make_user):
+    """More arrived than was ever routed - say so rather than inventing credit."""
+    john = make_user("john")
+    mike = make_user("mike")
+    p_john = payroll_service.add_payable(session, batch, john, Decimal("100"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+    payroll_service.assign_settlement(session, p_john, r_mike, Decimal("100"))
+    session.flush()
+
+    touched, leftover = settlement_service.record_payment_to(
+        session, batch.batch_id, mike.user_id, Decimal("400"), actor_user_id=1
+    )
+    session.flush()
+
+    assert len(touched) == 1
+    assert leftover == Decimal("300.00")
+    assert receivable_balance(r_mike).verified == Decimal("100.00")
+
+
+def test_paid_by_person_with_nothing_routed_applies_nothing(session, batch, make_user):
+    mike = make_user("mike")
+    payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+
+    touched, leftover = settlement_service.record_payment_to(
+        session, batch.batch_id, mike.user_id, Decimal("100"), actor_user_id=1
+    )
+    assert touched == []
+    assert leftover == Decimal("100.00")
+
+
+def test_paid_partially_clears_a_single_settlement(session, batch, make_user):
+    """The screenshot case: routed 500, only 100 arrived."""
+    john = make_user("john")
+    mike = make_user("mike")
+    p_john = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+    payroll_service.assign_settlement(session, p_john, r_mike, Decimal("500"))
+    session.flush()
+
+    touched, leftover = settlement_service.record_payment_to(
+        session, batch.batch_id, mike.user_id, Decimal("100"), actor_user_id=1
+    )
+    session.flush()
+
+    assert leftover == Decimal("0.00")
+    assert touched[0].amount == Decimal("100.00")
+    assert receivable_balance(r_mike).remaining == Decimal("400.00")
+    # And the unpaid 400 is routable again on both sides.
+    from payroll_bot.ledger import payable_balance
+    assert payable_balance(session.get(type(p_john), p_john.payable_id)).available == Decimal("400.00")

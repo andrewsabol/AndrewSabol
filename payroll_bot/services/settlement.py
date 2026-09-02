@@ -336,6 +336,64 @@ def verify_partial(
     return settlement
 
 
+def record_payment_to(
+    session: Session,
+    batch_id: int,
+    recipient_user_id: int,
+    amount: Decimal,
+    *,
+    actor_user_id: int,
+    reason: str | None = None,
+) -> tuple[list[Settlement], Decimal]:
+    """Credit ``amount`` against whatever is routed to this person.
+
+    Spends the money across their open settlements oldest first, verifying each
+    in full until the last, which is partially verified with whatever is left.
+    Returns the settlements touched and any amount that could not be applied
+    because nothing more is routed to them.
+
+    This is the by-person entry point: an admin knows "@mike got $100", not
+    which settlement id that lands on.
+    """
+    amount = money(amount)
+    if amount <= ZERO:
+        raise SettlementError("amount must be greater than zero")
+
+    open_settlements = session.execute(
+        select(Settlement)
+        .where(
+            Settlement.batch_id == batch_id,
+            Settlement.recipient_user_id == recipient_user_id,
+            Settlement.status.notin_(
+                [
+                    SettlementStatus.VERIFIED,
+                    SettlementStatus.CANCELLED,
+                    SettlementStatus.REJECTED,
+                ]
+            ),
+        )
+        .order_by(Settlement.settlement_id)
+    ).scalars().all()
+
+    touched: list[Settlement] = []
+    remaining = amount
+
+    for settlement in open_settlements:
+        if remaining <= ZERO:
+            break
+        if settlement.amount <= remaining:
+            remaining = money(remaining - settlement.amount)
+            admin_verify(session, settlement, actor_user_id=actor_user_id)
+        else:
+            verify_partial(
+                session, settlement, remaining, actor_user_id=actor_user_id, reason=reason
+            )
+            remaining = ZERO
+        touched.append(settlement)
+
+    return touched, remaining
+
+
 def admin_reject(
     session: Session,
     settlement: Settlement,

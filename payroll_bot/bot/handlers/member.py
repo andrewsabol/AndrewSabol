@@ -56,7 +56,9 @@ ADMIN_HELP = """
 /setmethod @handle venmo @TheirHandle — record one for them
 /delmethod @handle <id> — remove one
 /verify — review payments awaiting verification
-/partial <id> <amount> — record that less arrived than was routed
+/paid @mike 100 — record money someone actually received
+/paid @john @mike 100 — record a payment between two people
+/partial <id> <amount> — same, by settlement number
 /user @handle — one person's full position
 /reassign <id> to @user [amount] — re-route a settlement
 /cancelsettlement <id> [reason] — free an amount for reassignment

@@ -817,6 +817,7 @@ def build_handlers() -> list:
         CommandHandler("next", next_command),
         CommandHandler("verify", needs_verification),
         CommandHandler("partial", partial_command),
+        CommandHandler("paid", paid_command),
     ]
 
 
@@ -1129,10 +1130,18 @@ async def partial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await reply(update, usage)
         return
 
+    if not args[0].isdigit():
+        await reply(
+            update,
+            f"`{args[0]}` is not a settlement number.\n\n"
+            f"To record a payment by person, use `/paid {args[0]} {args[1]}` "
+            "instead — no settlement number needed.",
+        )
+        return
     try:
         settlement_id = int(args[0])
         received = money(args[1])
-    except (ValueError, MoneyError) as exc:
+    except MoneyError as exc:
         await reply(update, f"❌ {exc}\n\n{usage}")
         return
 
@@ -1190,5 +1199,180 @@ async def partial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"{settlement.payer.label} is verified. You are still owed "
             f"{views.fmt(still_owed, settlement.currency)}.",
         )
+
+    await reply(update, text)
+
+
+async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/paid @mike 100`` or ``/paid @john @mike 100``.
+
+    The by-person way to record money that actually changed hands. An admin
+    knows who got paid and how much, not which settlement id that lands on.
+
+    With one handle, the amount is credited against whatever is already routed
+    to that person. With two, it records a payment from the first to the second
+    directly, creating the settlement and verifying it in one step -- so a
+    payment that happened before anything was routed can still be recorded.
+    """
+    args = context.args or []
+    handles = [a for a in args if a.startswith("@")]
+    amounts = [a for a in args if not a.startswith("@")]
+
+    usage = (
+        "*Record a payment that actually happened.*\n\n"
+        "`/paid @mike 100`\n"
+        "   Credits $100 against what's routed to @mike.\n\n"
+        "`/paid @john @mike 100`\n"
+        "   Records that @john sent @mike $100, even if nothing was routed yet.\n\n"
+        "Amounts are what *actually arrived*, not what was owed."
+    )
+    if not handles or not amounts:
+        await reply(update, usage)
+        return
+
+    try:
+        amount = money(amounts[0])
+    except MoneyError as exc:
+        await reply(update, f"❌ {exc}\n\n{usage}")
+        return
+    if amount <= ZERO:
+        await reply(update, "❌ Amount must be greater than zero.")
+        return
+
+    reason = " ".join(amounts[1:]) or None
+
+    with session_scope() as session:
+        if not require_admin(session, update, context):
+            await deny(update)
+            return
+
+        actor = touch_user(session, update)
+        batch = payroll_service.active_batch(session)
+        if batch is None:
+            await reply(update, "No active payroll. Start one with /payroll.")
+            return
+
+        recipient = find_user(session, handles[-1])
+        if recipient is None:
+            await reply(update, f"No user matching {handles[-1]}.")
+            return
+
+        receivable = session.execute(
+            select(Receivable).where(
+                Receivable.batch_id == batch.batch_id,
+                Receivable.user_id == recipient.user_id,
+            )
+        ).scalars().first()
+        if receivable is None:
+            await reply(
+                update,
+                f"{recipient.label} is not owed anything in payroll "
+                f"#{batch.label}, so there is nothing to credit.",
+            )
+            return
+
+        # Two handles: the payer is named, so the payment can be recorded even
+        # if nothing was routed between them yet.
+        if len(handles) >= 2:
+            payer = find_user(session, handles[0])
+            if payer is None:
+                await reply(update, f"No user matching {handles[0]}.")
+                return
+            if payer.user_id == recipient.user_id:
+                await reply(update, "A person cannot pay themselves.")
+                return
+
+            payable = session.execute(
+                select(Payable).where(
+                    Payable.batch_id == batch.batch_id,
+                    Payable.user_id == payer.user_id,
+                )
+            ).scalars().first()
+            if payable is None:
+                await reply(
+                    update,
+                    f"{payer.label} has no payable in payroll #{batch.label}. "
+                    f"Add them with `/payroll` under OWES first.",
+                )
+                return
+
+            headroom = min(
+                payable_balance(payable).available,
+                receivable_balance(receivable).available,
+            )
+            if amount > headroom:
+                await reply(
+                    update,
+                    f"❌ Only {views.fmt(headroom, batch.currency)} can be recorded "
+                    f"between {payer.label} and {recipient.label} right now.\n\n"
+                    f"{payer.label} unassigned: "
+                    f"{views.fmt(payable_balance(payable).available, batch.currency)}\n"
+                    f"{recipient.label} unassigned: "
+                    f"{views.fmt(receivable_balance(receivable).available, batch.currency)}",
+                )
+                return
+
+            settlement = payroll_service.assign_settlement(
+                session, payable, receivable, amount, actor_user_id=actor.user_id
+            )
+            settlement_service.admin_verify(
+                session, settlement, actor_user_id=actor.user_id
+            )
+            session.flush()
+            still = receivable_balance(receivable).remaining
+            text = (
+                f"✅ Recorded: {payer.label} → {recipient.label} "
+                f"{views.fmt(amount, batch.currency)}\n\n"
+                f"{recipient.label} is now owed "
+                f"{views.fmt(still, batch.currency)}."
+            )
+            await reply(update, text)
+            return
+
+        # One handle: spend it against whatever is already routed to them.
+        touched, leftover = settlement_service.record_payment_to(
+            session,
+            batch.batch_id,
+            recipient.user_id,
+            amount,
+            actor_user_id=actor.user_id,
+            reason=reason,
+        )
+        session.flush()
+
+        if not touched:
+            await reply(
+                update,
+                f"Nothing is routed to {recipient.label} yet, so there is no "
+                f"payment to credit.\n\n"
+                f"Name the sender and I'll record it anyway:\n"
+                f"`/paid @sender {recipient.label} {amount}`",
+            )
+            return
+
+        applied = money(amount - leftover)
+        still = receivable_balance(receivable).remaining
+        lines = [
+            f"✅ Recorded {views.fmt(applied, batch.currency)} received by "
+            f"{recipient.label}.",
+            "",
+        ]
+        for settlement in touched:
+            lines.append(
+                f"  from {settlement.payer.label} — "
+                f"{views.fmt(settlement.amount, settlement.currency)}"
+            )
+        lines.append("")
+        lines.append(
+            f"{recipient.label} is still owed {views.fmt(still, batch.currency)}."
+        )
+        if leftover > ZERO:
+            lines.append("")
+            lines.append(
+                f"⚠️ {views.fmt(leftover, batch.currency)} could not be applied — "
+                f"that's more than was routed to them. Name the sender to record "
+                f"it: `/paid @sender {recipient.label} {leftover}`"
+            )
+        text = "\n".join(lines)
 
     await reply(update, text)
