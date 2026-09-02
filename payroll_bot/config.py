@@ -2,9 +2,46 @@
 
 from __future__ import annotations
 
+import codecs
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def _decode_env(raw: bytes) -> str:
+    """Decode .env bytes, tolerating the encodings Windows tools produce.
+
+    PowerShell's Out-File and Notepad write a byte-order mark, and PowerShell
+    5.1 defaults Out-File to UTF-16. A stray BOM would corrupt the first key
+    name, so the token would be silently ignored and the bot would report it as
+    unset despite a correct file.
+    """
+    for bom, encoding in (
+        (codecs.BOM_UTF8, "utf-8-sig"),
+        (codecs.BOM_UTF16_LE, "utf-16"),
+        (codecs.BOM_UTF16_BE, "utf-16"),
+    ):
+        if raw.startswith(bom):
+            return raw.decode(encoding)
+
+    if b"\x00" in raw:
+        # UTF-16 with the BOM stripped. Decoding this as UTF-8 would push null
+        # bytes into os.environ, which raises deep inside the stdlib with an
+        # error naming neither the file nor the key.
+        #
+        # Endianness comes from where the nulls fall, not from trial decoding:
+        # .env content is ASCII, so UTF-16-LE puts its nulls on odd offsets and
+        # UTF-16-BE on even ones. Big-endian text decodes as *valid* little-
+        # endian CJK, so a "did it decode?" check picks the wrong one.
+        even_nulls = raw[0::2].count(0)
+        odd_nulls = raw[1::2].count(0)
+        encoding = "utf-16-be" if even_nulls > odd_nulls else "utf-16-le"
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+
+    return raw.decode("utf-8")
 
 
 def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
@@ -18,7 +55,7 @@ def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
     if not env_path.is_file():
         return
 
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+    for raw_line in _decode_env(env_path.read_bytes()).splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
