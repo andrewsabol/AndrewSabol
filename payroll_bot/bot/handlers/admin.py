@@ -56,6 +56,33 @@ async def payroll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if len(inline) > 1 and inline[1].strip():
         return await _handle_payroll_text(update, context, inline[1])
 
+    chat = update.effective_chat
+    in_group = chat is not None and chat.type in ("group", "supergroup")
+
+    if in_group:
+        # Telegram's group privacy mode withholds any message that does not
+        # start with a slash, so a follow-up block would never reach the bot
+        # and this conversation would wait for input that cannot arrive.
+        await reply(
+            update,
+            "*PAYROLL ENTRY*\n\n"
+            "In a group, send the command and the balances as *one message*:\n\n"
+            "```\n"
+            "/payroll\n"
+            "OWES\n"
+            "@john 500\n"
+            "\n"
+            "OWED\n"
+            "@mike 300\n"
+            "```\n\n"
+            "_Use Shift+Enter for the line breaks._\n\n"
+            "A separate follow-up message will not reach me here: Telegram only "
+            "delivers messages starting with `/` to bots in groups. To send the "
+            "block separately, either message me directly, or turn off Group "
+            "Privacy in @BotFather and re-add me to this group.",
+        )
+        return ConversationHandler.END
+
     await reply(
         update,
         "*PAYROLL ENTRY*\n\n"
@@ -69,6 +96,7 @@ async def payroll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "@mike 300\n"
         "@sarah 600\n"
         "```\n\n"
+        "You can also send the command and the block together as one message.\n"
         "An optional description may follow the amount.\n"
         "Send /cancel to abort.",
     )
