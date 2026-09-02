@@ -16,12 +16,14 @@ from telegram.ext import (
 
 from ... import audit
 from ...db import session_scope
+from ... import queue as payment_queue
 from ...ledger import payable_balance, receivable_balance
-from ...models import BatchStatus, Receivable, Settlement
-from ...money import MoneyError, money
+from ...models import BatchStatus, Payable, Receivable, Settlement, User
+from ...money import ZERO, MoneyError, money
 from ...parsing import parse_payroll
 from ...services import payroll as payroll_service
 from ...services import settlement as settlement_service
+from ...services import accounts as accounts_service
 from ...services.accounts import find_user, set_admin, set_priority
 from ...strategies import default_strategy
 from .. import keyboards, notifications, views
@@ -96,14 +98,9 @@ async def _handle_payroll_text(
         await reply(update, preview)
         return AWAITING_PAYROLL
 
-    context.user_data[PENDING_PARSE] = parsed
-
-    if not parsed.balances:
-        # The spec is explicit: do not generate settlements until the admin
-        # confirms or fixes the discrepancy.
-        await reply(update, preview, markup=keyboards.imbalance_keyboard())
-        return AWAITING_PAYROLL
-
+    # An unbalanced payroll is normal, not an error: people are often owed
+    # before the payers covering them have settled up. The difference is
+    # reported, never used to block entry.
     await _commit_payroll(update, context, parsed)
     return ConversationHandler.END
 
@@ -133,24 +130,6 @@ async def _commit_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE, pa
     )
 
 
-async def confirm_imbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    parsed = context.user_data.get(PENDING_PARSE)
-    if parsed is None:
-        await edit_or_reply(update, "That payroll entry has expired. Send /payroll again.")
-        return ConversationHandler.END
-
-    await _commit_payroll(update, context, parsed)
-    await reply(
-        update,
-        "⚠️ Saved with an unbalanced payroll. Settlements can only route the "
-        "smaller of the two sides until you correct it.",
-    )
-    return ConversationHandler.END
-
-
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop(PENDING_PARSE, None)
     await reply(update, "Cancelled.")
@@ -177,7 +156,6 @@ async def generate_settlements(update: Update, context: ContextTypes.DEFAULT_TYP
             await reply(update, "No active payroll. Start one with /payroll.")
             return
 
-        totals = payroll_service.batch_totals(session, batch)
         result = payroll_service.generate_plan(
             session,
             batch,
@@ -198,16 +176,9 @@ async def generate_settlements(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data[PENDING_PLAN] = result
     context.user_data[PENDING_BATCH] = batch_id
 
-    header = ""
-    if not totals.balances:
-        header = (
-            "⚠️ *PAYROLL DOES NOT BALANCE*\n"
-            f"Difference: {views.fmt(abs(totals.difference), cfg.currency)}\n\n"
-        )
-
     await reply(
         update,
-        header + views.plan_preview(result, cfg.currency),
+        views.plan_preview(result, cfg.currency),
         markup=keyboards.plan_keyboard(),
     )
 
@@ -812,5 +783,205 @@ def build_handlers() -> list:
         CommandHandler("priority", priority_command),
         CommandHandler("audit", audit_command),
         CommandHandler("generate", generate_settlements),
+        CommandHandler("queue", queue_command),
+        CommandHandler("next", next_command),
         CommandHandler("verify", needs_verification),
     ]
+
+
+# --------------------------------------------------------------------------
+# Payment queue
+# --------------------------------------------------------------------------
+
+
+async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/queue`` -- everyone waiting to be paid, longest wait first."""
+    cfg = config_of(context)
+    if update.callback_query is not None:
+        await update.callback_query.answer()
+
+    with session_scope() as session:
+        if not require_admin(session, update, context):
+            await deny(update)
+            return
+        batch = payroll_service.active_batch(session)
+        if batch is None:
+            await reply(update, "No active payroll. Start one with /payroll.")
+            return
+        entries = payment_queue.build_queue(session, batch.batch_id)
+        text = views.queue_list(entries, cfg.currency)
+
+    await edit_or_reply(update, text, markup=keyboards.queue_list_keyboard())
+
+
+async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/next [@payer]`` -- the person at the front of the queue.
+
+    With a payer named, the card also says whether that payer can actually pay
+    this person, and offers to assign the payment.
+    """
+    payer_handle = (context.args or [None])[0]
+    await _show_queue_position(update, context, index=0, payer_handle=payer_handle)
+
+
+async def queue_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Skip / previous. Wraps around so cycling the queue never dead-ends."""
+    query = update.callback_query
+    await query.answer()
+    action, args = keyboards.decode(query.data)
+
+    index = int(args[0])
+    payer_user_id = int(args[1]) if len(args) > 1 else None
+    index = index + 1 if action == keyboards.QUEUE_SKIP else index - 1
+
+    await _show_queue_position(
+        update, context, index=index, payer_user_id=payer_user_id, edit=True
+    )
+
+
+async def _show_queue_position(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    index: int,
+    payer_handle: str | None = None,
+    payer_user_id: int | None = None,
+    edit: bool = False,
+) -> None:
+    cfg = config_of(context)
+
+    with session_scope() as session:
+        if not require_admin(session, update, context):
+            await deny(update)
+            return
+
+        batch = payroll_service.active_batch(session)
+        if batch is None:
+            await reply(update, "No active payroll. Start one with /payroll.")
+            return
+
+        payer = None
+        payer_methods: frozenset[str] = frozenset()
+        payable = None
+
+        if payer_handle:
+            payer = find_user(session, payer_handle)
+            if payer is None:
+                await reply(update, f"No user matching {payer_handle}.")
+                return
+        elif payer_user_id:
+            payer = session.get(User, payer_user_id)
+
+        if payer is not None:
+            payer_methods = frozenset(
+                m.kind.value
+                for m in accounts_service.list_payment_methods(session, payer.user_id)
+            )
+            payable = session.execute(
+                select(Payable).where(
+                    Payable.batch_id == batch.batch_id,
+                    Payable.user_id == payer.user_id,
+                )
+            ).scalars().first()
+
+        entry, total = payment_queue.entry_at(session, batch.batch_id, index)
+        if entry is None:
+            await edit_or_reply(
+                update,
+                "*PAYMENT QUEUE*\n\n_Nobody is waiting to be paid._",
+                markup=keyboards.back_to_dashboard(),
+            )
+            return
+
+        shared = entry.shares_method_with(payer_methods) if payer else None
+
+        # Only offer to assign when the maths would actually allow it.
+        can_assign = False
+        if payer is not None and payable is not None:
+            available = payable_balance(payable).available
+            can_assign = available > ZERO and entry.unassigned > ZERO
+
+        text = views.queue_card(
+            entry, total, cfg.currency, payer=payer, shared=shared
+        )
+        if payer is not None and payable is None:
+            text += f"\n\n⚠️ {payer.label} has no payable in this payroll."
+        elif payer is not None and not can_assign:
+            text += "\n\n_Nothing left to assign between these two._"
+
+        markup = keyboards.queue_card_keyboard(
+            index % total,
+            total,
+            payer_user_id=payer.user_id if payer else None,
+            receivable_id=entry.receivable.receivable_id,
+            can_assign=can_assign,
+        )
+
+    if edit:
+        await edit_or_reply(update, text, markup=markup)
+    else:
+        await reply(update, text, markup=markup)
+
+
+async def queue_assign(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route as much as both sides allow from this payer to this recipient."""
+    query = update.callback_query
+    await query.answer()
+    _, args = keyboards.decode(query.data)
+    receivable_id, payer_user_id = int(args[0]), int(args[1])
+
+    with session_scope() as session:
+        if not require_admin(session, update, context):
+            await deny(update)
+            return
+
+        actor = touch_user(session, update)
+        receivable = session.get(Receivable, receivable_id)
+        if receivable is None:
+            await edit_or_reply(update, "That receivable no longer exists.")
+            return
+
+        payable = session.execute(
+            select(Payable).where(
+                Payable.batch_id == receivable.batch_id,
+                Payable.user_id == payer_user_id,
+            )
+        ).scalars().first()
+        if payable is None:
+            await edit_or_reply(update, "That payer has no payable in this payroll.")
+            return
+
+        amount = min(
+            payable_balance(payable).available, receivable_balance(receivable).available
+        )
+        if amount <= ZERO:
+            await edit_or_reply(
+                update, "Nothing left to assign between those two."
+            )
+            return
+
+        try:
+            settlement = payroll_service.assign_settlement(
+                session, payable, receivable, amount, actor_user_id=actor.user_id
+            )
+        except Exception as exc:
+            await edit_or_reply(update, f"❌ Could not assign: `{exc}`")
+            return
+
+        session.flush()
+        text = (
+            f"✅ *Assigned.*\n\n"
+            f"{settlement.payer.label} → {settlement.recipient.label}: "
+            f"{views.fmt(settlement.amount, settlement.currency)}"
+        )
+        if settlement.payment_method_note:
+            text += f"\n{settlement.payment_method_note}"
+        if settlement.needs_admin_review:
+            text += "\n\n⚠️ No shared payment method — flagged for review."
+
+        delivered = await notifications.notify_plan_approved(
+            context.bot, session, [settlement]
+        )
+        text += f"\n\n{delivered.summary}"
+
+    await edit_or_reply(update, text, markup=keyboards.queue_list_keyboard())

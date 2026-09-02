@@ -16,7 +16,6 @@ PLAN_APPROVE = "plan_ok"
 PLAN_RECALC = "plan_recalc"
 PLAN_EDIT = "plan_edit"
 PLAN_CANCEL = "plan_cancel"
-PAYROLL_CONFIRM_IMBALANCE = "pr_imbal"
 
 MARK_PAID = "paid"
 ADD_REFERENCE = "ref"
@@ -37,6 +36,13 @@ DASH_DISPUTES = "d_disp"
 DASH_GENERATE = "d_gen"
 DASH_REPORTS = "d_rep"
 DASH_HOME = "d_home"
+DASH_QUEUE = "d_queue"
+DASH_NEXT = "d_next"
+
+QUEUE_SKIP = "q_skip"
+QUEUE_BACK = "q_back"
+QUEUE_ASSIGN = "q_assign"
+QUEUE_LIST = "q_list"
 
 
 def encode(action: str, *args: object) -> str:
@@ -55,20 +61,6 @@ def plan_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("🔄 Recalculate", callback_data=PLAN_RECALC),
                 InlineKeyboardButton("✏️ Edit", callback_data=PLAN_EDIT),
-            ],
-            [InlineKeyboardButton("❌ Cancel", callback_data=PLAN_CANCEL)],
-        ]
-    )
-
-
-def imbalance_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "⚠️ Save anyway (I understand)",
-                    callback_data=PAYROLL_CONFIRM_IMBALANCE,
-                )
             ],
             [InlineKeyboardButton("❌ Cancel", callback_data=PLAN_CANCEL)],
         ]
@@ -156,10 +148,75 @@ def dashboard_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Reports", callback_data=DASH_REPORTS),
             ],
             [
+                InlineKeyboardButton("⏭ Next In Line", callback_data=DASH_NEXT),
+                InlineKeyboardButton("📋 Queue", callback_data=DASH_QUEUE),
+            ],
+            [
                 InlineKeyboardButton(
                     "⚙️ Generate Settlements", callback_data=DASH_GENERATE
                 )
             ],
+        ]
+    )
+
+
+def queue_card_keyboard(
+    index: int,
+    total: int,
+    *,
+    payer_user_id: int | None = None,
+    receivable_id: int | None = None,
+    can_assign: bool = False,
+) -> InlineKeyboardMarkup:
+    """Controls for one person in the queue.
+
+    Skip steps to the next person and wraps at the end, so an admin cycling to
+    find someone a payer can actually pay never reaches a dead end.
+    """
+    suffix = [payer_user_id] if payer_user_id else []
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if can_assign and receivable_id is not None and payer_user_id:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✅ Assign this payment",
+                    callback_data=encode(QUEUE_ASSIGN, receivable_id, payer_user_id),
+                )
+            ]
+        )
+
+    nav = []
+    if total > 1:
+        nav.append(
+            InlineKeyboardButton(
+                "⬅️ Previous", callback_data=encode(QUEUE_BACK, index, *suffix)
+            )
+        )
+        nav.append(
+            InlineKeyboardButton(
+                "Skip ➡️", callback_data=encode(QUEUE_SKIP, index, *suffix)
+            )
+        )
+    if nav:
+        rows.append(nav)
+
+    rows.append(
+        [
+            InlineKeyboardButton("📋 Whole queue", callback_data=QUEUE_LIST),
+            InlineKeyboardButton("⬅️ Dashboard", callback_data=DASH_HOME),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def queue_list_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⏭ Next in line", callback_data=DASH_NEXT),
+                InlineKeyboardButton("⬅️ Dashboard", callback_data=DASH_HOME),
+            ]
         ]
     )
 

@@ -7,6 +7,8 @@ tests.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from ..ledger import Balance
 from ..matching import MatchResult
 from ..models import (
@@ -16,7 +18,7 @@ from ..models import (
     SettlementStatus,
     User,
 )
-from ..money import fmt
+from ..money import ZERO, fmt
 from ..parsing import ParsedPayroll
 from ..services.payroll import BatchTotals
 from ..services.settlement import UserPosition
@@ -81,22 +83,29 @@ def payroll_preview(parsed: ParsedPayroll, currency: str = "USD") -> str:
         lines.append("Fix these lines and send the payroll again.")
         return "\n".join(lines)
 
-    if not parsed.balances:
-        lines.append("⚠️ *PAYROLL DOES NOT BALANCE*")
-        lines.append(
-            f"Total Owed: {fmt(parsed.total_owed, currency)}\n"
-            f"Total Receivable: {fmt(parsed.total_receivable, currency)}\n"
-            f"Difference: {fmt(abs(parsed.difference), currency)}"
-        )
-        lines.append("")
-        lines.append(
-            "Settlements will *not* be generated until you fix this or "
-            "explicitly confirm the imbalance."
-        )
-    else:
-        lines.append("✅ Payroll balances.")
-
+    lines.append(_imbalance_note(parsed.difference, currency))
     return "\n".join(lines)
+
+
+def _imbalance_note(difference: Decimal, currency: str) -> str:
+    """Describe the gap between the two sides.
+
+    A payroll is not required to balance: people are routinely owed money
+    before the payers covering them have settled up. The difference is a
+    schedule, not an error, so it is described rather than flagged.
+    """
+    if difference == ZERO:
+        return "✅ Both sides match exactly."
+    if difference > ZERO:
+        return (
+            f"ℹ️ {fmt(difference, currency)} more is owed *in* than is owed out. "
+            "The surplus stays unrouted until someone is owed it."
+        )
+    return (
+        f"ℹ️ {fmt(abs(difference), currency)} more is owed *out* than has come in. "
+        "The queue pays people in the order they were added, so this covers "
+        "the front of the line first and the rest waits for later payers."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -177,12 +186,8 @@ def dashboard(batch_label: str, totals: BatchTotals, currency: str = "USD") -> s
     ]
     if totals.flagged:
         lines.append(f"Flagged for review: {totals.flagged}")
-    if not totals.balances:
-        lines.append("")
-        lines.append(
-            f"⚠️ *PAYROLL DOES NOT BALANCE* — difference "
-            f"{fmt(abs(totals.difference), currency)}"
-        )
+    lines.append("")
+    lines.append(_imbalance_note(totals.difference, currency))
     return "\n".join(lines)
 
 
@@ -400,3 +405,106 @@ def escape_markdown(text: str) -> str:
     for char in ("_", "*", "[", "]", "`"):
         text = text.replace(char, f"\\{char}")
     return text
+
+
+# --------------------------------------------------------------------------
+# Payment queue
+# --------------------------------------------------------------------------
+
+
+def queue_list(entries: list, currency: str = "USD", limit: int = 25) -> str:
+    """The whole line, in order."""
+    if not entries:
+        return (
+            "*PAYMENT QUEUE*\n\n_Nobody is waiting to be paid._\n\n"
+            "Add people with /payroll under `OWED`."
+        )
+
+    total = sum((e.still_owed for e in entries), ZERO)
+    lines = [
+        "*PAYMENT QUEUE*",
+        f"{len(entries)} waiting · {fmt(total, currency)} still owed",
+        "_Longest wait first._",
+        "",
+    ]
+
+    for entry in entries[:limit]:
+        waited = entry.waited_days()
+        age = "today" if waited == 0 else f"{waited}d"
+        marker = "▸" if entry.unassigned > ZERO else "·"
+        lines.append(
+            f"`{entry.position:>2}` {marker} {entry.user.label} — "
+            f"{fmt(entry.still_owed, currency)}  _{age}_"
+        )
+        if entry.unassigned <= ZERO:
+            lines.append("      _fully assigned, awaiting payment_")
+
+    if len(entries) > limit:
+        lines.append(f"\n_…and {len(entries) - limit} more._")
+
+    lines.append("")
+    lines.append("▸ = still needs someone assigned to pay them")
+    return "\n".join(lines)
+
+
+def queue_card(
+    entry,
+    total_in_queue: int,
+    currency: str = "USD",
+    payer=None,
+    shared: frozenset | None = None,
+) -> str:
+    """One person in the queue, with every way to pay them."""
+    waited = entry.waited_days()
+    age = "added today" if waited == 0 else f"waiting {waited} day{'s' if waited != 1 else ''}"
+
+    lines = [
+        f"*NEXT IN LINE* · {entry.position} of {total_in_queue}",
+        "",
+        f"*{entry.user.label}*",
+        f"Still owed: {fmt(entry.still_owed, currency)}",
+    ]
+
+    if entry.unassigned != entry.still_owed:
+        lines.append(f"Not yet assigned: {fmt(entry.unassigned, currency)}")
+    if entry.balance.verified > ZERO:
+        lines.append(f"Already received: {fmt(entry.balance.verified, currency)}")
+    lines.append(f"_{age}_")
+    lines.append("")
+
+    if entry.payment_methods:
+        lines.append("*Pay them with:*")
+        for method in entry.payment_methods:
+            mark = ""
+            if shared is not None:
+                mark = "  ✅" if method.kind.value in shared else "  ✗"
+            lines.append(f"  {method.display}{mark}")
+    else:
+        lines.append("⚠️ *No payment methods on file.*")
+        lines.append("They need to send `/methods add venmo @handle` to the bot.")
+    lines.append("")
+
+    if payer is not None:
+        if shared:
+            lines.append(
+                f"{payer.label} can pay them by "
+                + ", ".join(sorted(k.title() for k in shared))
+                + "."
+            )
+        else:
+            lines.append(
+                f"⚠️ {payer.label} shares no payment method with them — "
+                "skip to the next person, or assign anyway and sort it out manually."
+            )
+
+    if entry.incoming:
+        lines.append("")
+        lines.append("*Already routed to them:*")
+        for settlement in entry.incoming:
+            lines.append(
+                f"  {settlement.payer.label} — "
+                f"{fmt(settlement.amount, settlement.currency)} — "
+                f"{_STATUS_TEXT[settlement.status]}"
+            )
+
+    return "\n".join(lines)

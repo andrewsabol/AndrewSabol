@@ -60,11 +60,6 @@ def build_application(config: Config) -> Application:
     application.add_handler(
         CallbackQueryHandler(admin.cancel_plan, pattern=f"^{keyboards.PLAN_CANCEL}$")
     )
-    application.add_handler(
-        CallbackQueryHandler(
-            admin.confirm_imbalance, pattern=f"^{keyboards.PAYROLL_CONFIRM_IMBALANCE}$"
-        )
-    )
 
     # Dashboard.
     application.add_handler(
@@ -89,6 +84,26 @@ def build_application(config: Config) -> Application:
                 f"{keyboards.DASH_REPORTS})$"
             ),
         )
+    )
+
+    # Payment queue.
+    application.add_handler(
+        CallbackQueryHandler(admin.queue_command, pattern=f"^{keyboards.DASH_QUEUE}$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(admin.queue_command, pattern=f"^{keyboards.QUEUE_LIST}$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(admin.next_command, pattern=f"^{keyboards.DASH_NEXT}$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            admin.queue_step,
+            pattern=f"^({keyboards.QUEUE_SKIP}|{keyboards.QUEUE_BACK}):",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(admin.queue_assign, pattern=f"^{keyboards.QUEUE_ASSIGN}:")
     )
 
     # Settlement lifecycle.

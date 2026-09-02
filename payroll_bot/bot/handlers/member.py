@@ -49,6 +49,8 @@ ADMIN_HELP = """
 /payroll — enter OWES / OWED balances
 /dashboard — current payroll overview
 /generate — build a settlement plan
+/queue — everyone waiting to be paid, in order
+/next [@payer] — the next person in line, with their payment methods
 /verify — review payments awaiting verification
 /user @handle — one person's full position
 /reassign <id> to @user [amount] — re-route a settlement

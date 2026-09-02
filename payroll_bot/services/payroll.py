@@ -597,6 +597,68 @@ def approve_plan(
     return created
 
 
+def assign_settlement(
+    session: Session,
+    payable: Payable,
+    receivable: Receivable,
+    amount: Decimal,
+    *,
+    actor_user_id: int | None = None,
+) -> Settlement:
+    """Route one payment by hand, outside the matching engine.
+
+    Used by the queue browser, where an admin picks the pairing themselves.
+    Capacity is validated exactly as it is for a generated plan -- a manual
+    assignment gets no licence to overdraw a balance.
+    """
+    amount = money(amount)
+    assert_capacity(payable, receivable, amount)
+
+    payer_kinds = _methods_for(session, payable.user_id)
+    recipient_kinds = _methods_for(session, receivable.user_id)
+    shared = payer_kinds & recipient_kinds
+    method = _pick_method(
+        session, receivable.user_id, sorted(shared)[0] if shared else None
+    )
+
+    settlement = Settlement(
+        batch_id=payable.batch_id,
+        payer_user_id=payable.user_id,
+        recipient_user_id=receivable.user_id,
+        amount=amount,
+        currency=payable.currency,
+        payable=payable,
+        receivable=receivable,
+        payment_method_id=method.payment_method_id if method else None,
+        payment_method_note=method.display if method else None,
+        needs_admin_review=not shared,
+        status=SettlementStatus.PENDING,
+    )
+    session.add(settlement)
+    session.flush()
+
+    audit.record(
+        session,
+        AuditAction.SETTLEMENT_GENERATED,
+        actor_user_id=actor_user_id,
+        batch_id=payable.batch_id,
+        entity_type="settlement",
+        entity_id=settlement.settlement_id,
+        amount=amount,
+        detail=(
+            f"manually assigned {payable.user.label} → {receivable.user.label} "
+            f"{fmt(amount, payable.currency)} from the payment queue"
+        ),
+    )
+
+    batch = session.get(PayrollBatch, payable.batch_id)
+    if batch is not None and batch.status is BatchStatus.DRAFT:
+        set_batch_status(
+            session, batch, BatchStatus.IN_PROGRESS, actor_user_id=actor_user_id
+        )
+    return settlement
+
+
 def _pick_method(
     session: Session, user_id: int, preferred_kind: str | None
 ) -> PaymentMethod | None:
