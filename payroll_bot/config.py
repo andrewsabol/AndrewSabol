@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import codecs
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+#: A Telegram bot token is the bot's numeric id, a colon, then its secret.
+_TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
 
 
 def _decode_env(raw: bytes) -> str:
@@ -88,6 +93,15 @@ class Config:
         if not token:
             raise SystemExit(
                 "TELEGRAM_BOT_TOKEN is not set. Copy .env.example to .env and fill it in."
+            )
+        if not _TOKEN_PATTERN.match(token):
+            # Catch the placeholder before python-telegram-bot fails on it with
+            # an InvalidToken traceback that says nothing about .env.
+            raise SystemExit(
+                f"TELEGRAM_BOT_TOKEN does not look like a Telegram token: {token!r}\n"
+                "It should look like 1234567890:AAHfakeExampleTokenFromBotFather "
+                "- a number, a colon, then about 35 letters and digits.\n"
+                "Get one from @BotFather in Telegram and put it in your .env file."
             )
 
         raw_admins = os.environ.get("ADMIN_TELEGRAM_IDS", "")
