@@ -37,6 +37,7 @@ holds or transfers money — you pay people directly.
 *Your commands*
 /balance — what you owe and what you're owed
 /methods — manage your Venmo / Cash App / Zelle handles
+/whoami — your Telegram ID and admin status
 /help — show this message
 
 Amounts you owe are settled by paying other people directly; the bot works out
@@ -63,6 +64,50 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         touch_user(session, update)
         admin = require_admin(session, update, context)
     await reply(update, WELCOME + (ADMIN_HELP if admin else ""))
+
+
+async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report the caller's identity and admin status.
+
+    Exists to diagnose the bootstrap case: without it, a refused command gives
+    no way to tell a wrong ADMIN_TELEGRAM_IDS from a missing one.
+    """
+    tg_user = update.effective_user
+    cfg = config_of(context)
+
+    with session_scope() as session:
+        user = touch_user(session, update)
+        admin = require_admin(session, update, context)
+        flagged = user.is_admin
+        username = user.username
+
+    lines = [
+        "*WHO YOU ARE*",
+        "",
+        f"Telegram ID: `{tg_user.id}`",
+        f"Username: {'@' + username if username else '_none set_'}",
+        f"Administrator: {'✅ yes' if admin else '❌ no'}",
+        "",
+        f"IDs loaded from `.env`: `{sorted(cfg.admin_telegram_ids) or 'none'}`",
+        f"Flagged admin in database: {'yes' if flagged else 'no'}",
+    ]
+
+    if not admin:
+        lines += [
+            "",
+            "To become an administrator, put this line in `.env` and restart:",
+            f"`ADMIN_TELEGRAM_IDS={tg_user.id}`",
+        ]
+
+    if not username:
+        lines += [
+            "",
+            "⚠️ You have no Telegram username. Payroll entries identify people "
+            "by @username, so set one in Telegram Settings before being added "
+            "to a payroll.",
+        ]
+
+    await reply(update, "\n".join(lines))
 
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -383,6 +428,7 @@ def build_handlers() -> list:
         CommandHandler("start", start_command),
         CommandHandler("help", help_command),
         CommandHandler("balance", balance_command),
+        CommandHandler("whoami", whoami_command),
         CommandHandler("methods", methods_command),
     ]
 

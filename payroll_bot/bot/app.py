@@ -145,4 +145,16 @@ def run(config: Config | None = None) -> None:
     application = build_application(config)
 
     log.info("payroll settlement bot starting (database: %s)", config.database_url)
+    if config.admin_telegram_ids:
+        log.info(
+            "bootstrap admin Telegram IDs: %s",
+            ", ".join(str(i) for i in sorted(config.admin_telegram_ids)),
+        )
+    else:
+        # Without this nobody can run /payroll, and the only symptom is a
+        # refusal message that looks like a permissions bug.
+        log.warning(
+            "ADMIN_TELEGRAM_IDS is empty - no one can use admin commands. "
+            "Send /whoami to the bot to get your ID, put it in .env, restart."
+        )
     application.run_polling(allowed_updates=Update.ALL_TYPES)

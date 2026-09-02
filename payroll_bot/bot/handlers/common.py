@@ -47,7 +47,22 @@ def require_admin(session: Session, update: Update, context: ContextTypes.DEFAUL
 
 
 async def deny(update: Update) -> None:
-    await reply(update, "🚫 This command is for payroll administrators only.")
+    """Refuse a non-admin, showing them the ID an admin would need to add.
+
+    Bootstrapping the first admin is the most common setup stumble, and a bare
+    refusal gives no way to tell a wrong ID from a missing one.
+    """
+    tg_user = update.effective_user
+    detail = ""
+    if tg_user is not None:
+        detail = (
+            f"\n\nYour Telegram ID is `{tg_user.id}`.\n"
+            "To grant yourself access, put it in `ADMIN_TELEGRAM_IDS` in the "
+            "`.env` file and restart the bot."
+        )
+    await reply(
+        update, "🚫 This command is for payroll administrators only." + detail
+    )
 
 
 async def reply(
