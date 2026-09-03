@@ -818,6 +818,7 @@ def build_handlers() -> list:
         CommandHandler("verify", needs_verification),
         CommandHandler("partial", partial_command),
         CommandHandler("paid", paid_command),
+        CommandHandler("clear", clear_command),
     ]
 
 
@@ -1373,6 +1374,97 @@ async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"that's more than was routed to them. Name the sender to record "
                 f"it: `/paid @sender {recipient.label} {leftover}`"
             )
+        text = "\n".join(lines)
+
+    await reply(update, text)
+
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/clear @handle [reason]`` -- write off what someone still owes or is owed.
+
+    For a debt forgiven, an amount entered in error, or money settled outside
+    the payroll. Not for recording a payment between two people here: that is
+    /paid, which credits the recipient as well.
+    """
+    args = context.args or []
+    if not args:
+        await reply(
+            update,
+            "*Write off an outstanding balance.*\n\n"
+            "`/clear @john` — clears what @john still owes\n"
+            "`/clear @mike settled in cash` — reason is optional\n\n"
+            "Use this only when *no money moved inside the payroll* — a debt "
+            "forgiven, a typo, or a payment made outside the system.\n\n"
+            "If someone actually paid someone here, use `/paid` instead so the "
+            "recipient is credited too.",
+        )
+        return
+
+    reason = " ".join(args[1:]) or None
+
+    with session_scope() as session:
+        if not require_admin(session, update, context):
+            await deny(update)
+            return
+
+        actor = touch_user(session, update)
+        batch = payroll_service.active_batch(session)
+        if batch is None:
+            await reply(update, "No active payroll. Start one with /payroll.")
+            return
+
+        target = find_user(session, args[0])
+        if target is None:
+            await reply(update, f"No user matching {args[0]}.")
+            return
+
+        payable = session.execute(
+            select(Payable).where(
+                Payable.batch_id == batch.batch_id, Payable.user_id == target.user_id
+            )
+        ).scalars().first()
+        receivable = session.execute(
+            select(Receivable).where(
+                Receivable.batch_id == batch.batch_id,
+                Receivable.user_id == target.user_id,
+            )
+        ).scalars().first()
+
+        entries = [e for e in (payable, receivable) if e is not None]
+        if not entries:
+            await reply(
+                update,
+                f"{target.label} has no balance in payroll #{batch.label}.",
+            )
+            return
+
+        cleared_lines: list[str] = []
+        problems: list[str] = []
+        for entry in entries:
+            side = "owed by" if isinstance(entry, Payable) else "owed to"
+            try:
+                cleared = payroll_service.write_off(
+                    session, entry, actor_user_id=actor.user_id, reason=reason
+                )
+            except payroll_service.PayrollError as exc:
+                problems.append(f"  {side} — {exc}")
+                continue
+            cleared_lines.append(
+                f"  {views.fmt(cleared, entry.currency)} {side} {target.label}"
+            )
+
+        session.flush()
+
+        if not cleared_lines:
+            await reply(update, "❌ Nothing was cleared.\n\n" + "\n".join(problems))
+            return
+
+        lines = [f"✅ *Cleared for {target.label}.*", ""] + cleared_lines
+        if problems:
+            lines += ["", "Not cleared:"] + problems
+        if reason:
+            lines += ["", f"_Reason: {reason}_"]
+        lines += ["", "Recorded in /audit. No money was credited to anyone."]
         text = "\n".join(lines)
 
     await reply(update, text)

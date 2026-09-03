@@ -49,15 +49,22 @@ class Balance:
     original: Decimal
     reserved: Decimal
     verified: Decimal
+    cancelled: bool = False
+    """Written off. The original figure is kept for the record, but nothing is
+    outstanding and nothing may be routed."""
 
     @property
     def remaining(self) -> Decimal:
         """What is still genuinely owed: original minus verified."""
+        if self.cancelled:
+            return ZERO
         return money(self.original - self.verified)
 
     @property
     def available(self) -> Decimal:
         """What may still be routed into a new settlement."""
+        if self.cancelled:
+            return ZERO
         return money(self.original - self.verified - self.reserved)
 
     @property
@@ -89,18 +96,26 @@ def _tally(settlements: list[Settlement]) -> tuple[Decimal, Decimal]:
 
 
 def payable_balance(payable: Payable) -> Balance:
+    from .models import LedgerStatus
+
     reserved, verified = _tally(list(payable.settlements))
     return Balance(
-        original=money(payable.original_amount), reserved=reserved, verified=verified
+        original=money(payable.original_amount),
+        reserved=reserved,
+        verified=verified,
+        cancelled=payable.status is LedgerStatus.CANCELLED,
     )
 
 
 def receivable_balance(receivable: Receivable) -> Balance:
+    from .models import LedgerStatus
+
     reserved, verified = _tally(list(receivable.settlements))
     return Balance(
         original=money(receivable.original_amount),
         reserved=reserved,
         verified=verified,
+        cancelled=receivable.status is LedgerStatus.CANCELLED,
     )
 
 
@@ -201,9 +216,15 @@ class UserBalanceSummary:
 
 
 def aggregate(balances: list[Balance]) -> Balance:
-    """Combine several balances into one (used for per-user and batch totals)."""
+    """Combine several balances into one (used for per-user and batch totals).
+
+    A written-off entry contributes nothing outstanding, so its original is
+    left out of the total too -- otherwise a batch would keep reporting money
+    that has been cleared.
+    """
+    live = [b for b in balances if not b.cancelled]
     return Balance(
-        original=money(sum((b.original for b in balances), ZERO)),
-        reserved=money(sum((b.reserved for b in balances), ZERO)),
+        original=money(sum((b.original for b in live), ZERO)),
+        reserved=money(sum((b.reserved for b in live), ZERO)),
         verified=money(sum((b.verified for b in balances), ZERO)),
     )

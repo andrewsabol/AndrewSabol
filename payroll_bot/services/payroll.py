@@ -354,6 +354,63 @@ def modify_balance(
     )
 
 
+def write_off(
+    session: Session,
+    entry: Payable | Receivable,
+    *,
+    actor_user_id: int | None = None,
+    reason: str | None = None,
+) -> Decimal:
+    """Clear whatever is still outstanding on a payable or receivable.
+
+    For a debt forgiven, an amount entered in error, or money settled outside
+    the payroll entirely. Distinct from recording a payment: nothing is
+    credited to anyone, so use this only when no money changed hands inside
+    the system.
+
+    Verified payments are preserved -- the entry is reduced to what was
+    actually paid rather than erased, so the history of real payments survives.
+    Refuses while settlements are still routed against it, since writing off an
+    amount someone has been told to pay would leave them holding an instruction
+    for money nobody expects any more.
+    """
+    is_payable = isinstance(entry, Payable)
+    balance = payable_balance(entry) if is_payable else receivable_balance(entry)
+
+    if balance.remaining <= ZERO:
+        raise PayrollError(f"{entry.user.label} has nothing outstanding to clear")
+
+    if balance.reserved > ZERO:
+        raise PayrollError(
+            f"{fmt(balance.reserved, entry.currency)} is still routed to a "
+            "settlement. Cancel those with /cancelsettlement first, so nobody "
+            "is left holding a payment instruction."
+        )
+
+    cleared = balance.remaining
+    # The original figure is left alone -- the CANCELLED status carries the
+    # meaning, so both what was entered and what was really paid stay on the
+    # record rather than being rewritten to look like a smaller debt.
+    entry.status = LedgerStatus.CANCELLED
+    sync_remaining(entry)
+
+    audit.record(
+        session,
+        AuditAction.BALANCE_MODIFIED,
+        actor_user_id=actor_user_id,
+        batch_id=entry.batch_id,
+        entity_type="payable" if is_payable else "receivable",
+        entity_id=entry.payable_id if is_payable else entry.receivable_id,
+        amount=cleared,
+        detail=(
+            f"wrote off {fmt(cleared, entry.currency)} "
+            f"{'owed by' if is_payable else 'owed to'} {entry.user.label}"
+            + (f": {reason}" if reason else "")
+        ),
+    )
+    return cleared
+
+
 # --------------------------------------------------------------------------
 # Balance reporting
 # --------------------------------------------------------------------------

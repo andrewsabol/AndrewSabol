@@ -556,3 +556,101 @@ def test_paid_partially_clears_a_single_settlement(session, batch, make_user):
     # And the unpaid 400 is routable again on both sides.
     from payroll_bot.ledger import payable_balance
     assert payable_balance(session.get(type(p_john), p_john.payable_id)).available == Decimal("400.00")
+
+
+# --------------------------------------------------------------------------
+# Writing off a balance
+# --------------------------------------------------------------------------
+
+
+def test_clearing_a_payable_zeroes_what_they_owe(session, batch, make_user):
+    from payroll_bot.ledger import payable_balance
+
+    john = make_user("john")
+    payable = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    session.flush()
+
+    cleared = payroll_service.write_off(session, payable, actor_user_id=1)
+    session.flush()
+
+    assert cleared == Decimal("500.00")
+    assert payable_balance(payable).remaining == Decimal("0.00")
+
+
+def test_clearing_keeps_payments_that_really_happened(session, batch, make_user):
+    """A write-off drops the unpaid remainder, never the verified history."""
+    from payroll_bot.ledger import payable_balance
+
+    john = make_user("john")
+    mike = make_user("mike")
+    payable = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+
+    settlement = payroll_service.assign_settlement(
+        session, payable, r_mike, Decimal("200")
+    )
+    settlement_service.admin_verify(session, settlement, actor_user_id=1)
+    session.flush()
+
+    cleared = payroll_service.write_off(session, payable, actor_user_id=1)
+    session.flush()
+
+    assert cleared == Decimal("300.00")
+    balance = payable_balance(payable)
+    assert balance.verified == Decimal("200.00")
+    assert balance.remaining == Decimal("0.00")
+
+
+def test_clearing_is_refused_while_a_settlement_is_routed(session, batch, make_user):
+    """Writing off money someone was told to pay would strand the instruction."""
+    john = make_user("john")
+    mike = make_user("mike")
+    payable = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    r_mike = payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+    payroll_service.assign_settlement(session, payable, r_mike, Decimal("500"))
+    session.flush()
+
+    with pytest.raises(payroll_service.PayrollError, match="cancel"):
+        payroll_service.write_off(session, payable, actor_user_id=1)
+
+
+def test_clearing_a_receivable_removes_them_from_the_queue(session, batch, make_user):
+    mike = make_user("mike")
+    receivable = payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+
+    payroll_service.write_off(session, receivable, actor_user_id=1, reason="paid in cash")
+    session.flush()
+
+    assert payment_queue.build_queue(session, batch.batch_id) == []
+
+
+def test_clearing_nothing_outstanding_is_refused(session, batch, make_user):
+    john = make_user("john")
+    payable = payroll_service.add_payable(session, batch, john, Decimal("100"))
+    session.flush()
+    payroll_service.write_off(session, payable, actor_user_id=1)
+    session.flush()
+
+    with pytest.raises(payroll_service.PayrollError, match="nothing outstanding"):
+        payroll_service.write_off(session, payable, actor_user_id=1)
+
+
+def test_a_write_off_is_recorded_in_the_audit_trail(session, batch, make_user):
+    from payroll_bot import audit
+
+    john = make_user("john")
+    payable = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    session.flush()
+    payroll_service.write_off(
+        session, payable, actor_user_id=1, reason="settled outside payroll"
+    )
+    session.flush()
+
+    detail = " ".join(
+        e.detail or "" for e in audit.history(session, batch_id=batch.batch_id)
+    )
+    assert "wrote off" in detail
+    assert "settled outside payroll" in detail

@@ -59,6 +59,7 @@ ADMIN_HELP = """
 /paid @mike 100 — record money someone actually received
 /paid @john @mike 100 — record a payment between two people
 /partial <id> <amount> — same, by settlement number
+/clear @user [reason] — write off what they still owe or are owed
 /user @handle — one person's full position
 /reassign <id> to @user [amount] — re-route a settlement
 /cancelsettlement <id> [reason] — free an amount for reassignment
