@@ -18,7 +18,7 @@ from ... import audit
 from ...db import session_scope
 from ... import queue as payment_queue
 from ...ledger import payable_balance, receivable_balance
-from ...models import BatchStatus, Payable, Receivable, Settlement, User
+from ...models import Payable, Receivable, Settlement, User
 from ...money import ZERO, MoneyError, money
 from ...parsing import parse_payroll
 from ...services import payroll as payroll_service
@@ -137,8 +137,13 @@ async def _commit_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE, pa
     cfg = config_of(context)
     with session_scope() as session:
         actor = touch_user(session, update)
+        # Add to the batch already in progress rather than starting a new one.
+        # Balances arrive continuously - someone owes more today than they did
+        # this morning - and spawning a batch per entry would scatter one
+        # ledger across many, hiding older entries from the queue. A genuinely
+        # new period is what /newpayroll is for.
         batch = payroll_service.active_batch(session)
-        if batch is None or batch.status is not BatchStatus.DRAFT:
+        if batch is None:
             batch = payroll_service.create_batch(
                 session, currency=cfg.currency, actor_user_id=actor.user_id
             )
@@ -819,6 +824,8 @@ def build_handlers() -> list:
         CommandHandler("partial", partial_command),
         CommandHandler("paid", paid_command),
         CommandHandler("clear", clear_command),
+        CommandHandler("owes", owes_command),
+        CommandHandler("owed", owed_command),
     ]
 
 
@@ -1465,6 +1472,105 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if reason:
             lines += ["", f"_Reason: {reason}_"]
         lines += ["", "Recorded in /audit. No money was credited to anyone."]
+        text = "\n".join(lines)
+
+    await reply(update, text)
+
+
+async def owes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/owes @john 200 [note]`` -- add to what someone owes in."""
+    await _add_balance(update, context, side="owes")
+
+
+async def owed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/owed @mike 300 [note]`` -- add to what someone is owed."""
+    await _add_balance(update, context, side="owed")
+
+
+async def _add_balance(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, side: str
+) -> None:
+    """One-liner entry for a single person.
+
+    The OWES/OWED block is right for entering a whole payroll at once, but
+    adding one person to a running ledger through it is heavy - and in a group
+    it means retyping the whole multi-line message.
+    """
+    args = context.args or []
+    verb = "owes" if side == "owes" else "is owed"
+    usage = (
+        f"Usage: `/{side} @handle <amount> [note]`\n"
+        f"Example: `/{side} @john 200 late fee`\n\n"
+        f"Adds to what they already {verb} — it does not replace it."
+    )
+    if len(args) < 2:
+        await reply(update, usage)
+        return
+
+    try:
+        amount = money(args[1])
+    except MoneyError as exc:
+        await reply(update, f"❌ {exc}\n\n{usage}")
+        return
+    if amount <= ZERO:
+        await reply(
+            update,
+            "❌ Amount must be greater than zero. To reduce a balance, use "
+            "`/paid` (money changed hands) or `/clear` (write it off).",
+        )
+        return
+
+    note = " ".join(args[2:]) or None
+
+    with session_scope() as session:
+        if not require_admin(session, update, context):
+            await deny(update)
+            return
+
+        actor = touch_user(session, update)
+        cfg = config_of(context)
+        batch = payroll_service.active_batch(session)
+        if batch is None:
+            batch = payroll_service.create_batch(
+                session, currency=cfg.currency, actor_user_id=actor.user_id
+            )
+
+        target = payroll_service.get_or_create_user(
+            session, username=args[0].lstrip("@")
+        )
+
+        if side == "owes":
+            payroll_service.add_payable(
+                session, batch, target, amount, description=note,
+                actor_user_id=actor.user_id,
+            )
+        else:
+            payroll_service.add_receivable(
+                session, batch, target, amount, description=note,
+                actor_user_id=actor.user_id,
+            )
+        session.flush()
+
+        position = settlement_service.user_position(
+            session, batch.batch_id, target.user_id
+        )
+        balance = position.owes if side == "owes" else position.owed
+
+        lines = [
+            f"✅ Added {views.fmt(amount, batch.currency)} to what "
+            f"{target.label} {verb}.",
+            "",
+            f"Total {verb}: {views.fmt(balance.original, batch.currency)}",
+        ]
+        if balance.verified > ZERO:
+            lines.append(
+                f"Already settled: {views.fmt(balance.verified, batch.currency)}"
+            )
+        lines.append(
+            f"Outstanding: {views.fmt(balance.remaining, batch.currency)}"
+        )
+        lines.append("")
+        lines.append(f"_Payroll #{batch.label}_")
         text = "\n".join(lines)
 
     await reply(update, text)

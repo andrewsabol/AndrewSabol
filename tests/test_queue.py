@@ -654,3 +654,56 @@ def test_a_write_off_is_recorded_in_the_audit_trail(session, batch, make_user):
     )
     assert "wrote off" in detail
     assert "settled outside payroll" in detail
+
+
+# --------------------------------------------------------------------------
+# Adding to a running ledger
+# --------------------------------------------------------------------------
+
+
+def test_adding_a_second_payable_increases_the_total(session, batch, make_user):
+    """Balances arrive over time; a later entry adds rather than replaces."""
+    from payroll_bot.ledger import aggregate, payable_balance
+
+    john = make_user("john")
+    first = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    second = payroll_service.add_payable(
+        session, batch, john, Decimal("200"), description="late fee"
+    )
+    session.flush()
+
+    combined = aggregate([payable_balance(first), payable_balance(second)])
+    assert combined.original == Decimal("700.00")
+    assert combined.remaining == Decimal("700.00")
+
+    totals = payroll_service.batch_totals(session, batch)
+    assert totals.payable.original == Decimal("700.00")
+
+
+def test_a_second_receivable_joins_the_queue_behind_the_first(session, batch, make_user):
+    mike = make_user("mike")
+    sarah = make_user("sarah")
+    payroll_service.add_receivable(session, batch, mike, Decimal("300"))
+    payroll_service.add_receivable(session, batch, sarah, Decimal("400"))
+    payroll_service.add_receivable(session, batch, mike, Decimal("100"))
+    session.flush()
+
+    entries = payment_queue.build_queue(session, batch.batch_id)
+    # Mike's later claim queues behind Sarah's, by when each was added.
+    assert [e.user.label for e in entries] == ["@mike", "@sarah", "@mike"]
+    assert payment_queue.total_outstanding(session, batch.batch_id) == Decimal("800.00")
+
+
+def test_a_written_off_entry_leaves_the_batch_totals(session, batch, make_user):
+    john = make_user("john")
+    keep = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    drop = payroll_service.add_payable(session, batch, john, Decimal("200"))
+    session.flush()
+
+    payroll_service.write_off(session, drop, actor_user_id=1, reason="entered twice")
+    session.flush()
+
+    totals = payroll_service.batch_totals(session, batch)
+    assert totals.payable.original == Decimal("500.00")
+    assert totals.payable.remaining == Decimal("500.00")
+    assert keep.status.value == "OPEN"

@@ -48,6 +48,8 @@ ADMIN_HELP = """
 
 *Administrator commands*
 /payroll — enter OWES / OWED balances
+/owes @john 200 — add to what one person owes
+/owed @mike 300 — add to what one person is owed
 /dashboard — current payroll overview
 /generate — build a settlement plan
 /queue — everyone waiting to be paid, in order
