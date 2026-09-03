@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
 
 from sqlalchemy import select
 from telegram import Update
@@ -1398,8 +1399,9 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await reply(
             update,
             "*Write off an outstanding balance.*\n\n"
-            "`/clear @john` — clears what @john still owes\n"
-            "`/clear @mike settled in cash` — reason is optional\n\n"
+            "`/clear @john 15` — knocks $15 off what @john owes\n"
+            "`/clear @john` — clears the whole outstanding amount\n"
+            "`/clear @john 15 paid in cash` — reason is optional\n\n"
             "Use this only when *no money moved inside the payroll* — a debt "
             "forgiven, a typo, or a payment made outside the system.\n\n"
             "If someone actually paid someone here, use `/paid` instead so the "
@@ -1407,7 +1409,20 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    reason = " ".join(args[1:]) or None
+    # An amount may follow the handle; anything after that is the reason.
+    amount: Decimal | None = None
+    rest = args[1:]
+    if rest:
+        try:
+            amount = money(rest[0])
+            rest = rest[1:]
+        except MoneyError:
+            amount = None
+    reason = " ".join(rest) or None
+
+    if amount is not None and amount <= ZERO:
+        await reply(update, "❌ Amount to clear must be greater than zero.")
+        return
 
     with session_scope() as session:
         if not require_admin(session, update, context):
@@ -1451,13 +1466,20 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             side = "owed by" if isinstance(entry, Payable) else "owed to"
             try:
                 cleared = payroll_service.write_off(
-                    session, entry, actor_user_id=actor.user_id, reason=reason
+                    session, entry, amount,
+                    actor_user_id=actor.user_id, reason=reason,
                 )
             except payroll_service.PayrollError as exc:
                 problems.append(f"  {side} — {exc}")
                 continue
+            balance = (
+                payable_balance(entry)
+                if isinstance(entry, Payable)
+                else receivable_balance(entry)
+            )
             cleared_lines.append(
-                f"  {views.fmt(cleared, entry.currency)} {side} {target.label}"
+                f"  {views.fmt(cleared, entry.currency)} {side} {target.label} "
+                f"— {views.fmt(balance.remaining, entry.currency)} left"
             )
 
         session.flush()

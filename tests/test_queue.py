@@ -661,9 +661,9 @@ def test_a_write_off_is_recorded_in_the_audit_trail(session, batch, make_user):
 # --------------------------------------------------------------------------
 
 
-def test_adding_a_second_payable_increases_the_total(session, batch, make_user):
-    """Balances arrive over time; a later entry adds rather than replaces."""
-    from payroll_bot.ledger import aggregate, payable_balance
+def test_a_second_entry_combines_into_one_balance(session, batch, make_user):
+    """One person carries one balance per side; entering more raises it."""
+    from payroll_bot.ledger import payable_balance
 
     john = make_user("john")
     first = payroll_service.add_payable(session, batch, john, Decimal("500"))
@@ -672,15 +672,15 @@ def test_adding_a_second_payable_increases_the_total(session, batch, make_user):
     )
     session.flush()
 
-    combined = aggregate([payable_balance(first), payable_balance(second)])
-    assert combined.original == Decimal("700.00")
-    assert combined.remaining == Decimal("700.00")
+    assert second is first, "a second entry must fold into the first"
+    assert payable_balance(first).original == Decimal("700.00")
 
     totals = payroll_service.batch_totals(session, batch)
     assert totals.payable.original == Decimal("700.00")
+    assert totals.people_owing == 1
 
 
-def test_a_second_receivable_joins_the_queue_behind_the_first(session, batch, make_user):
+def test_combining_never_shows_someone_twice_in_the_queue(session, batch, make_user):
     mike = make_user("mike")
     sarah = make_user("sarah")
     payroll_service.add_receivable(session, batch, mike, Decimal("300"))
@@ -689,15 +689,31 @@ def test_a_second_receivable_joins_the_queue_behind_the_first(session, batch, ma
     session.flush()
 
     entries = payment_queue.build_queue(session, batch.batch_id)
-    # Mike's later claim queues behind Sarah's, by when each was added.
-    assert [e.user.label for e in entries] == ["@mike", "@sarah", "@mike"]
+    assert [e.user.label for e in entries] == ["@mike", "@sarah"]
+    assert entries[0].still_owed == Decimal("400.00")
     assert payment_queue.total_outstanding(session, batch.batch_id) == Decimal("800.00")
 
 
-def test_a_written_off_entry_leaves_the_batch_totals(session, batch, make_user):
+def test_topping_up_keeps_a_persons_place_in_the_queue(session, batch, make_user):
+    """Being owed more on Friday must not cost someone their Monday place."""
+    mike = make_user("mike")
+    sarah = make_user("sarah")
+    payroll_service.add_receivable(session, batch, mike, Decimal("300"))
+    payroll_service.add_receivable(session, batch, sarah, Decimal("400"))
+    session.flush()
+    payroll_service.add_receivable(session, batch, mike, Decimal("500"))
+    session.flush()
+
+    entries = payment_queue.build_queue(session, batch.batch_id)
+    assert entries[0].user.label == "@mike"
+    assert entries[0].still_owed == Decimal("800.00")
+
+
+def test_a_written_off_balance_leaves_the_batch_totals(session, batch, make_user):
     john = make_user("john")
+    chris = make_user("chris")
     keep = payroll_service.add_payable(session, batch, john, Decimal("500"))
-    drop = payroll_service.add_payable(session, batch, john, Decimal("200"))
+    drop = payroll_service.add_payable(session, batch, chris, Decimal("200"))
     session.flush()
 
     payroll_service.write_off(session, drop, actor_user_id=1, reason="entered twice")
@@ -707,3 +723,83 @@ def test_a_written_off_entry_leaves_the_batch_totals(session, batch, make_user):
     assert totals.payable.original == Decimal("500.00")
     assert totals.payable.remaining == Decimal("500.00")
     assert keep.status.value == "OPEN"
+
+
+def test_a_new_entry_after_a_write_off_starts_fresh(session, batch, make_user):
+    """A cleared balance is deliberately closed and must not be revived."""
+    john = make_user("john")
+    first = payroll_service.add_payable(session, batch, john, Decimal("500"))
+    payroll_service.write_off(session, first, actor_user_id=1)
+    session.flush()
+
+    second = payroll_service.add_payable(session, batch, john, Decimal("200"))
+    session.flush()
+
+    assert second is not first
+    assert payroll_service.batch_totals(session, batch).payable.original == Decimal("200.00")
+
+
+# --------------------------------------------------------------------------
+# Knocking part of a balance off
+# --------------------------------------------------------------------------
+
+
+def test_clearing_part_of_a_balance_leaves_the_rest(session, batch, make_user):
+    """The headline case: owed 100, knock 15 off, 85 left."""
+    from payroll_bot.ledger import payable_balance
+
+    jlee = make_user("jlee")
+    payable = payroll_service.add_payable(session, batch, jlee, Decimal("100"))
+    session.flush()
+
+    cleared = payroll_service.write_off(
+        session, payable, Decimal("15"), actor_user_id=1, reason="paid in cash"
+    )
+    session.flush()
+
+    assert cleared == Decimal("15.00")
+    balance = payable_balance(payable)
+    assert balance.original == Decimal("85.00")
+    assert balance.remaining == Decimal("85.00")
+    assert payable.status.value == "OPEN"
+
+
+def test_clearing_more_than_is_outstanding_is_refused(session, batch, make_user):
+    jlee = make_user("jlee")
+    payable = payroll_service.add_payable(session, batch, jlee, Decimal("100"))
+    session.flush()
+
+    with pytest.raises(payroll_service.PayrollError, match="outstanding"):
+        payroll_service.write_off(session, payable, Decimal("150"), actor_user_id=1)
+
+
+def test_clearing_the_exact_outstanding_amount_closes_it(session, batch, make_user):
+    from payroll_bot.ledger import payable_balance
+
+    jlee = make_user("jlee")
+    payable = payroll_service.add_payable(session, batch, jlee, Decimal("100"))
+    session.flush()
+
+    payroll_service.write_off(session, payable, Decimal("100"), actor_user_id=1)
+    session.flush()
+
+    assert payable_balance(payable).remaining == Decimal("0.00")
+    assert payable.status.value == "CANCELLED"
+
+
+def test_a_partial_clear_is_recorded_with_both_figures(session, batch, make_user):
+    from payroll_bot import audit
+
+    jlee = make_user("jlee")
+    payable = payroll_service.add_payable(session, batch, jlee, Decimal("100"))
+    session.flush()
+    payroll_service.write_off(
+        session, payable, Decimal("15"), actor_user_id=1, reason="paid in cash"
+    )
+    session.flush()
+
+    detail = " ".join(
+        e.detail or "" for e in audit.history(session, batch_id=batch.batch_id)
+    )
+    assert "wrote off" in detail and "$15.00" in detail
+    assert "paid in cash" in detail

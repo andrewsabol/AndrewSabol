@@ -196,6 +196,13 @@ def add_payable(
     if amount <= ZERO:
         raise PayrollError("payable amount must be greater than zero")
 
+    existing = _open_entry(session, Payable, batch.batch_id, user.user_id)
+    if existing is not None:
+        return _top_up(
+            session, existing, amount, description=description,
+            actor_user_id=actor_user_id,
+        )
+
     payable = Payable(
         batch_id=batch.batch_id,
         user_id=user.user_id,
@@ -232,6 +239,13 @@ def add_receivable(
     if amount <= ZERO:
         raise PayrollError("receivable amount must be greater than zero")
 
+    existing = _open_entry(session, Receivable, batch.batch_id, user.user_id)
+    if existing is not None:
+        return _top_up(
+            session, existing, amount, description=description,
+            actor_user_id=actor_user_id,
+        )
+
     receivable = Receivable(
         batch_id=batch.batch_id,
         user_id=user.user_id,
@@ -253,6 +267,69 @@ def add_receivable(
         detail=f"{user.label} is owed {fmt(amount, batch.currency)}",
     )
     return receivable
+
+
+def _open_entry(session: Session, model, batch_id: int, user_id: int):
+    """The person's live entry of this kind in this batch, if any.
+
+    A written-off entry is deliberately closed, so it is never revived -- a new
+    one is started instead.
+    """
+    return session.execute(
+        select(model).where(
+            model.batch_id == batch_id,
+            model.user_id == user_id,
+            model.status != LedgerStatus.CANCELLED,
+        )
+        .order_by(model.created_at, getattr(model, "payable_id", None)
+                  if model is Payable else model.receivable_id)
+    ).scalars().first()
+
+
+def _top_up(
+    session: Session,
+    entry: Payable | Receivable,
+    amount: Decimal,
+    *,
+    description: str | None = None,
+    actor_user_id: int | None = None,
+):
+    """Fold a further amount into a person's existing balance.
+
+    One person carries one balance per side, so entering more for them raises
+    the figure they already have rather than opening a second entry. Two rows
+    for the same person would show them twice in the queue and split their
+    position, and the audit trail records every addition anyway, so nothing is
+    lost by combining them.
+
+    The original creation time is kept, so someone who has been waiting since
+    Monday does not lose their place by being owed a little more on Friday.
+    """
+    is_payable = isinstance(entry, Payable)
+    previous = money(entry.original_amount)
+    entry.original_amount = money(previous + amount)
+    if description:
+        entry.description = (
+            f"{entry.description}; {description}" if entry.description else description
+        )
+    sync_remaining(entry)
+
+    audit.record(
+        session,
+        AuditAction.BALANCE_MODIFIED,
+        actor_user_id=actor_user_id,
+        batch_id=entry.batch_id,
+        entity_type="payable" if is_payable else "receivable",
+        entity_id=entry.payable_id if is_payable else entry.receivable_id,
+        amount=amount,
+        detail=(
+            f"{entry.user.label} {'owes' if is_payable else 'is owed'} "
+            f"{fmt(amount, entry.currency)} more: "
+            f"{fmt(previous, entry.currency)} → {fmt(entry.original_amount, entry.currency)}"
+            + (f" ({description})" if description else "")
+        ),
+    )
+    return entry
 
 
 def apply_parsed_payroll(
@@ -357,6 +434,7 @@ def modify_balance(
 def write_off(
     session: Session,
     entry: Payable | Receivable,
+    amount: Decimal | None = None,
     *,
     actor_user_id: int | None = None,
     reason: str | None = None,
@@ -387,11 +465,29 @@ def write_off(
             "is left holding a payment instruction."
         )
 
-    cleared = balance.remaining
-    # The original figure is left alone -- the CANCELLED status carries the
-    # meaning, so both what was entered and what was really paid stay on the
-    # record rather than being rewritten to look like a smaller debt.
-    entry.status = LedgerStatus.CANCELLED
+    if amount is not None:
+        amount = money(amount)
+        if amount <= ZERO:
+            raise PayrollError("amount to clear must be greater than zero")
+        if amount > balance.remaining:
+            raise PayrollError(
+                f"{entry.user.label} only has "
+                f"{fmt(balance.remaining, entry.currency)} outstanding"
+            )
+
+    if amount is None or amount >= balance.remaining:
+        cleared = balance.remaining
+        # Clearing the lot: the original figure is left alone, because the
+        # CANCELLED status carries the meaning. Both what was entered and what
+        # was really paid stay on the record rather than being rewritten to
+        # look like a smaller debt.
+        entry.status = LedgerStatus.CANCELLED
+    else:
+        # Clearing part of it does have to move the figure, since the entry
+        # stays live. The audit row keeps the amount before and after.
+        cleared = amount
+        entry.original_amount = money(entry.original_amount - amount)
+
     sync_remaining(entry)
 
     audit.record(
